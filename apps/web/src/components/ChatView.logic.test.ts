@@ -25,7 +25,6 @@ import {
 import {
   CommandId,
   EnvironmentId,
-  EventId,
   MessageId,
   ProjectId,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
@@ -43,7 +42,7 @@ import type { CodexArtifactTemplate } from "@t3tools/shared/codexArtifactTemplat
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { Atom, AsyncResult } from "effect/reactivity";
+import { Atom } from "effect/reactivity";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadDetails } from "../state/threads";
 
@@ -55,7 +54,6 @@ import {
   getAntigravitySendBlockReason,
   resolveBackgroundDraftWorkspaceOptions,
   resolveComposerInteractionMode,
-  restorePlanFollowUpComposer,
   resolveComposerProviderSelection,
   resolveProactiveTurnDiffAction,
   resolveDraftHeroState,
@@ -100,8 +98,10 @@ import {
   shouldShowBranchMismatchBanner,
   shouldShowPlanFollowUpPrompt,
   shouldWriteThreadErrorToCurrentServerThread,
+  interruptThreadRunForRewind,
+  revalidateIdleThreadForRewind,
+  revalidateMessageForRewind,
   waitForRevertedMessage,
-  prepareRevertedMessageAttachments,
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -2235,6 +2235,237 @@ describe("worktree setup visibility", () => {
       ...settledDone,
       sequence: 9,
     });
+  });
+});
+
+describe("interruptThreadRunForRewind", () => {
+  const threadRef = { environmentId: EnvironmentId.make("env-stop"), threadId: ThreadId.make("t") };
+  const targetRunId = RunId.make("run-target");
+
+  function projectionAtom(status: "queued" | "running" | "completed" | "interrupted") {
+    const base = makeThreadProjectionFixture();
+    const targetRun = {
+      id: targetRunId,
+      threadId: base.thread.id,
+      ordinal: 1,
+      providerInstanceId: base.thread.providerInstanceId,
+      modelSelection: base.thread.modelSelection,
+      providerThreadId: null,
+      userMessageId: MessageId.make("message-target"),
+      rootNodeId: null,
+      activeAttemptId: null,
+      status,
+      requestedAt: base.updatedAt,
+      startedAt: base.updatedAt,
+      completedAt: status === "completed" || status === "interrupted" ? base.updatedAt : null,
+      checkpointId: null,
+      contextHandoffId: null,
+    } as (typeof base.runs)[number];
+    const projection = { ...base, runs: [targetRun] };
+    const state = Atom.make({ environmentId: threadRef.environmentId, projection });
+    vi.spyOn(environmentThreadDetails, "threadAtom").mockReturnValue(state as never);
+    return { state, projection, targetRun };
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("skips interruption when the exact run is already terminal", async () => {
+    projectionAtom("completed");
+    const interrupt = vi.fn(async () => {});
+    await interruptThreadRunForRewind({ threadRef, runId: targetRunId, interrupt });
+    expect(interrupt).not.toHaveBeenCalled();
+  });
+
+  it("accepts natural completion that races an interrupt rejection", async () => {
+    const { state, projection, targetRun } = projectionAtom("running");
+    await interruptThreadRunForRewind({
+      threadRef,
+      runId: targetRunId,
+      interrupt: async () => {
+        appAtomRegistry.set(state, {
+          environmentId: threadRef.environmentId,
+          projection: {
+            ...projection,
+            runs: [{ ...targetRun, status: "completed", completedAt: projection.updatedAt }],
+          },
+        });
+        throw new Error("The run is no longer interruptible.");
+      },
+    });
+  });
+
+  it("waits for the exact run to become terminal", async () => {
+    const { state, projection, targetRun } = projectionAtom("running");
+    const interrupt = vi.fn(async () => {});
+    const waiting = interruptThreadRunForRewind({ threadRef, runId: targetRunId, interrupt });
+    await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+
+    appAtomRegistry.set(state, {
+      environmentId: threadRef.environmentId,
+      projection: {
+        ...projection,
+        runs: [{ ...targetRun, status: "interrupted", completedAt: projection.updatedAt }],
+      },
+    });
+    await waiting;
+  });
+
+  it("ignores unrelated run updates until the exact run stops", async () => {
+    const { state, projection, targetRun } = projectionAtom("running");
+    let outcome = "pending";
+    const waiting = interruptThreadRunForRewind({
+      threadRef,
+      runId: targetRunId,
+      interrupt: async () => {},
+    }).then(() => {
+      outcome = "stopped";
+    });
+    const unrelatedRun = {
+      ...targetRun,
+      id: RunId.make("run-unrelated"),
+      ordinal: 2,
+      status: "completed" as const,
+    };
+    appAtomRegistry.set(state, {
+      environmentId: threadRef.environmentId,
+      projection: { ...projection, runs: [targetRun, unrelatedRun] },
+    });
+    await Promise.resolve();
+    expect(outcome).toBe("pending");
+
+    appAtomRegistry.set(state, {
+      environmentId: threadRef.environmentId,
+      projection: {
+        ...projection,
+        runs: [{ ...targetRun, status: "interrupted", completedAt: projection.updatedAt }],
+      },
+    });
+    await waiting;
+    expect(outcome).toBe("stopped");
+  });
+
+  it("rejects when a replacement run starts before rewind", async () => {
+    const { state, projection, targetRun } = projectionAtom("running");
+    const waiting = interruptThreadRunForRewind({
+      threadRef,
+      runId: targetRunId,
+      interrupt: async () => {},
+    });
+    appAtomRegistry.set(state, {
+      environmentId: threadRef.environmentId,
+      projection: {
+        ...projection,
+        runs: [
+          { ...targetRun, status: "interrupted", completedAt: projection.updatedAt },
+          {
+            ...targetRun,
+            id: RunId.make("run-replacement"),
+            ordinal: 2,
+            status: "running",
+          },
+        ],
+      },
+    });
+    await expect(waiting).rejects.toThrow(
+      "The thread changed while stopping the current turn. Choose Edit from here again.",
+    );
+  });
+
+  it("times out without polling when the exact run stays active", async () => {
+    vi.useFakeTimers();
+    try {
+      projectionAtom("running");
+      const waiting = interruptThreadRunForRewind({
+        threadRef,
+        runId: targetRunId,
+        interrupt: async () => {},
+        timeoutMs: 50,
+      });
+      const outcome = expect(waiting).rejects.toThrow(
+        "Timed out waiting for the current turn to stop. No rewind was performed.",
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      await outcome;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["queued", "running"] as const)(
+    "rejects an idle rewind if a %s run appeared while confirmation was open",
+    (status) => {
+      const { state, projection, targetRun } = projectionAtom("completed");
+      expect(() => revalidateIdleThreadForRewind(threadRef)).not.toThrow();
+      appAtomRegistry.set(state, {
+        environmentId: threadRef.environmentId,
+        projection: {
+          ...projection,
+          runs: [{ ...targetRun, status, completedAt: null }],
+        },
+      });
+      expect(() => revalidateIdleThreadForRewind(threadRef)).toThrow(
+        "The thread changed before it could rewind. Choose Edit from here again.",
+      );
+    },
+  );
+
+  it("revalidates the selected message and checkpoint after interruption", () => {
+    const { state, projection, targetRun } = projectionAtom("completed");
+    const messageId = MessageId.make("message-target");
+    const checkpoint = {
+      id: "checkpoint-start",
+      threadId: projection.thread.id,
+      scopeId: "scope-1",
+      runId: null,
+      nodeId: "node-start",
+      parentCheckpointId: null,
+      ordinalWithinScope: 0,
+      appRunOrdinal: null,
+      ref: "checkpoint-start-ref",
+      status: "ready",
+      files: [],
+      capturedAt: projection.updatedAt,
+    } as never;
+    appAtomRegistry.set(state, {
+      environmentId: threadRef.environmentId,
+      projection: {
+        ...projection,
+        messages: [
+          {
+            id: messageId,
+            runId: targetRunId,
+            role: "user",
+          },
+        ] as never,
+        checkpoints: [checkpoint],
+      },
+    });
+
+    expect(
+      revalidateMessageForRewind(threadRef, {
+        messageId,
+        messageRunId: targetRunId,
+        turnCount: 0,
+      }),
+    ).toBe(checkpoint);
+
+    appAtomRegistry.set(state, {
+      environmentId: threadRef.environmentId,
+      projection: {
+        ...projection,
+        messages: [{ id: messageId, runId: targetRunId, role: "user" }] as never,
+        checkpoints: [checkpoint],
+        runs: [{ ...targetRun, status: "rolled_back" }],
+      },
+    });
+    expect(() =>
+      revalidateMessageForRewind(threadRef, {
+        messageId,
+        messageRunId: targetRunId,
+        turnCount: 0,
+      }),
+    ).toThrow("The thread changed while stopping the current turn. Choose Edit from here again.");
   });
 });
 

@@ -1385,6 +1385,7 @@ export function deriveMessagesTimelineRows(input: {
         checkpoints: input.turnDiffSummaries,
         threadStartCheckpointReady: input.threadStartCheckpointReady === true,
         unsettledRunId,
+        activeRunId: input.runningRunId ?? null,
         availableRevertTurnCounts: input.availableRevertTurnCounts,
       })
     : new Map<MessageId, number>();

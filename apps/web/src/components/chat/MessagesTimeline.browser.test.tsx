@@ -484,6 +484,75 @@ describe("MessagesTimeline work rows", () => {
 });
 
 describe("MessagesTimeline messages", () => {
+  it("keeps eligible edit actions enabled while an exact active run can be interrupted", async () => {
+    const completedRunId = RunId.make("run-completed");
+    const activeRunId = RunId.make("run-active");
+    const completedAssistantId = MessageId.make("assistant-completed");
+    const activeMessageId = MessageId.make("user-active");
+    const onRevertToTurnCount = vi.fn();
+    await using screen = await renderTimeline(
+      [
+        message(
+          "Earlier prompt",
+          { runId: completedRunId, inputIntent: "turn_start" },
+          "user-completed",
+        ),
+        message(
+          "Active prompt",
+          { runId: activeRunId, inputIntent: "turn_start" },
+          activeMessageId,
+        ),
+      ],
+      {
+        isWorking: true,
+        activeTurnInProgress: true,
+        latestRun: {
+          runId: activeRunId,
+          status: "running",
+          startedAt: CREATED_AT,
+          completedAt: null,
+        },
+        runningRunId: activeRunId,
+        supportsConversationRollback: true,
+        threadStartCheckpointReady: true,
+        availableRevertTurnCounts: new Set([0, 1]),
+        turnDiffSummaries: [
+          {
+            runId: completedRunId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("checkpoint-completed"),
+            status: "ready",
+            files: [],
+            assistantMessageId: completedAssistantId,
+            completedAt: CREATED_AT,
+          },
+        ],
+        onRevertToTurnCount,
+      },
+    );
+
+    const editButtons = screen.buttons("Edit from here") as HTMLButtonElement[];
+    expect(editButtons).toHaveLength(2);
+    expect(editButtons.every((button) => !button.disabled)).toBe(true);
+    await click(editButtons[1]!);
+    expect(onRevertToTurnCount).toHaveBeenCalledExactlyOnceWith(1, activeMessageId);
+  });
+
+  it("keeps edit disabled when work has no exact active run", async () => {
+    const runId = RunId.make("run-completed");
+    await using screen = await renderTimeline(
+      [message("Earlier prompt", { runId, inputIntent: "turn_start" }, "user-completed")],
+      {
+        isWorking: true,
+        supportsConversationRollback: true,
+        threadStartCheckpointReady: true,
+        availableRevertTurnCounts: new Set([0]),
+      },
+    );
+
+    expect((screen.button("Edit from here") as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it.each([
     { role: "assistant", selection: "across", findExpanded: false },
     { role: "assistant", selection: "across", findExpanded: true },

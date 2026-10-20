@@ -331,7 +331,11 @@ describe("V2 session presentation", () => {
     const targets = (
       ordinals: ReadonlyArray<number>,
       checkpoints: ReadonlyArray<ReturnType<typeof checkpoint>>,
-      options: { threadStartCheckpointReady?: boolean; unsettledRunId?: RunId } = {},
+      options: {
+        threadStartCheckpointReady?: boolean;
+        unsettledRunId?: RunId;
+        activeRunId?: RunId;
+      } = {},
     ) =>
       Object.fromEntries(
         deriveRevertTurnCountByUserMessageId({
@@ -339,6 +343,7 @@ describe("V2 session presentation", () => {
           checkpoints,
           threadStartCheckpointReady: options.threadStartCheckpointReady ?? true,
           unsettledRunId: options.unsettledRunId ?? null,
+          activeRunId: options.activeRunId ?? null,
         }),
       );
 
@@ -419,7 +424,7 @@ describe("V2 session presentation", () => {
       ).toEqual({ "user-1": 0, "user-3": 2 });
     });
 
-    it("hides edit when the predecessor is unavailable or the run is unsettled", () => {
+    it("requires a ready predecessor and exposes only the exact active unsettled run", () => {
       expect(targets([1, 2], [checkpoint(2)])).toEqual({ "user-1": 0 });
       expect(targets([1, 2], [checkpoint(1, "stale"), checkpoint(2)])).toEqual({ "user-1": 0 });
       // Earlier history is paged out, so the first loaded run's predecessor is unknown.
@@ -429,6 +434,19 @@ describe("V2 session presentation", () => {
       expect(targets([1, 2], [checkpoint(1), checkpoint(2)], { unsettledRunId: runId(2) })).toEqual(
         { "user-1": 0 },
       );
+      expect(
+        targets([1, 2], [checkpoint(1), checkpoint(2)], {
+          unsettledRunId: runId(2),
+          activeRunId: runId(2),
+        }),
+      ).toEqual({ "user-1": 0, "user-2": 1 });
+      expect(
+        targets([1], [checkpoint(1)], {
+          threadStartCheckpointReady: false,
+          unsettledRunId: runId(1),
+          activeRunId: runId(1),
+        }),
+      ).toEqual({});
     });
 
     it("can edit a cancelled run but cannot target its checkpoint without a provider turn", () => {

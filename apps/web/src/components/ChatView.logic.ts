@@ -58,7 +58,7 @@ import { stripInlineContextReferences } from "~/lib/composerContextReferences";
 import type { DraftThreadEnvMode } from "../composerDraftStore";
 import { collapseExpandedComposerCursor, type ComposerSubmissionIntent } from "../composer-logic";
 import type { ReviewCommentContext } from "../reviewCommentContext";
-import { derivePhase, type TimelineEntry } from "../session-logic";
+import { derivePhase, findRevertCheckpoint, type TimelineEntry } from "../session-logic";
 import type { PreviewMiniPlayerSource } from "../previewMiniPlayerStore";
 import type { DesktopPreviewOverlay } from "../previewStateStore";
 import type { RightPanelSurface } from "../rightPanelStore";
@@ -1065,6 +1065,132 @@ export async function waitForStartedServerThread(
     predicate: threadHasStarted,
     timeoutMs,
   });
+}
+
+const rewindBlockingRunStatuses: ReadonlySet<string> = new Set([
+  "preparing",
+  "starting",
+  "running",
+  "waiting",
+]);
+const rewindTerminalRunStatuses: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "rolled_back",
+]);
+const rewindIdleBlockingRunStatuses: ReadonlySet<string> = new Set([
+  ...rewindBlockingRunStatuses,
+  "queued",
+]);
+
+function inspectRunForRewind(threadRef: ScopedThreadRef, runId: RunId) {
+  const thread = appAtomRegistry.get(environmentThreadDetails.threadAtom(threadRef));
+  if (thread === null) return "missing" as const;
+  const run = thread.projection.runs.find((candidate) => candidate.id === runId);
+  if (run === undefined) return "missing" as const;
+  if (
+    thread.projection.runs.some(
+      (candidate) => candidate.id !== runId && rewindBlockingRunStatuses.has(candidate.status),
+    )
+  )
+    return "replaced" as const;
+  if (rewindTerminalRunStatuses.has(run.status)) return "terminal" as const;
+  return "active" as const;
+}
+
+function assertRunReadyForRewind(threadRef: ScopedThreadRef, runId: RunId): void {
+  const inspection = inspectRunForRewind(threadRef, runId);
+  if (inspection === "terminal") return;
+  if (inspection === "active") {
+    throw new Error("The current turn is still running. Choose Edit from here again.");
+  }
+  throw new Error(
+    "The thread changed while stopping the current turn. Choose Edit from here again.",
+  );
+}
+
+export async function interruptThreadRunForRewind(input: {
+  readonly threadRef: ScopedThreadRef;
+  readonly runId: RunId;
+  readonly interrupt: () => Promise<void>;
+  readonly timeoutMs?: number;
+}): Promise<void> {
+  const threadAtom = environmentThreadDetails.threadAtom(input.threadRef);
+  let inspection = inspectRunForRewind(input.threadRef, input.runId);
+  if (inspection === "terminal") return;
+  if (inspection !== "active") {
+    throw new Error(
+      "The thread changed while stopping the current turn. Choose Edit from here again.",
+    );
+  }
+
+  try {
+    await input.interrupt();
+  } catch (error) {
+    inspection = inspectRunForRewind(input.threadRef, input.runId);
+    if (inspection === "terminal") return;
+    throw error;
+  }
+
+  await waitForAtomValue({
+    registry: appAtomRegistry,
+    atom: threadAtom,
+    predicate: () => inspectRunForRewind(input.threadRef, input.runId) !== "active",
+    timeoutMs: input.timeoutMs ?? 30_000,
+  });
+
+  inspection = inspectRunForRewind(input.threadRef, input.runId);
+  if (inspection === "terminal") return;
+  if (inspection === "active") {
+    throw new Error("Timed out waiting for the current turn to stop. No rewind was performed.");
+  }
+  throw new Error(
+    "The thread changed while stopping the current turn. Choose Edit from here again.",
+  );
+}
+
+export function revalidateStoppedRunForRewind(threadRef: ScopedThreadRef, runId: RunId): void {
+  assertRunReadyForRewind(threadRef, runId);
+}
+
+export function revalidateIdleThreadForRewind(threadRef: ScopedThreadRef): void {
+  const thread = appAtomRegistry.get(environmentThreadDetails.threadAtom(threadRef));
+  if (
+    thread === null ||
+    thread.projection.runs.some((run) => rewindIdleBlockingRunStatuses.has(run.status))
+  ) {
+    throw new Error("The thread changed before it could rewind. Choose Edit from here again.");
+  }
+}
+
+export function revalidateMessageForRewind(
+  threadRef: ScopedThreadRef,
+  input: {
+    readonly messageId: MessageId;
+    readonly messageRunId: RunId;
+    readonly turnCount: number;
+  },
+) {
+  const thread = appAtomRegistry.get(environmentThreadDetails.threadAtom(threadRef));
+  const message = thread?.projection.messages.find((candidate) => candidate.id === input.messageId);
+  const run = thread?.projection.runs.find((candidate) => candidate.id === input.messageRunId);
+  const checkpoint = findRevertCheckpoint(thread?.projection.checkpoints ?? [], input.turnCount);
+  if (
+    thread === null ||
+    message?.role !== "user" ||
+    message.runId !== input.messageRunId ||
+    run === undefined ||
+    !rewindTerminalRunStatuses.has(run.status) ||
+    run.status === "rolled_back" ||
+    checkpoint === undefined
+  ) {
+    throw new Error(
+      "The thread changed while stopping the current turn. Choose Edit from here again.",
+    );
+  }
+  return checkpoint;
 }
 
 export async function waitForRevertedMessage(

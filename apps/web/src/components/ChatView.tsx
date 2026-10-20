@@ -415,6 +415,7 @@ import {
   openDeviceSetupDialog,
   openPullRequestThreadDialog,
   openRevertConfirm,
+  type PendingRevert,
   PullRequestThreadDialogHost,
   RevertConfirmHost,
 } from "./chat/ChatOverlayHosts";
@@ -513,6 +514,10 @@ import {
   readFileAsDataUrl,
   resolveFileAttachmentUrl,
   prepareRevertedMessageAttachments,
+  interruptThreadRunForRewind,
+  revalidateIdleThreadForRewind,
+  revalidateMessageForRewind,
+  revalidateStoppedRunForRewind,
   waitForRevertedMessage,
   reconcileMountedTerminalThreadIds,
   resolveComposerInteractionMode,
@@ -859,6 +864,45 @@ async function rewindToMessage(input: {
     return { error: null, prompt: nextPrompt };
   } catch (error) {
     return { error: error instanceof Error ? error.message : "Failed to revert thread state." };
+  }
+}
+
+async function stopAndRewindToMessage(input: {
+  readonly pending: PendingRevert;
+  readonly restoreFiles: boolean;
+  readonly interrupt: (() => Promise<void>) | null;
+  readonly rewind: Omit<
+    Parameters<typeof rewindToMessage>[0],
+    "turnCount" | "restoreFiles" | "checkpoint"
+  >;
+}): ReturnType<typeof rewindToMessage> {
+  try {
+    if (input.pending.interruptRunId !== null) {
+      if (input.interrupt === null)
+        throw new Error("The active turn can no longer be interrupted.");
+      await interruptThreadRunForRewind({
+        threadRef: input.rewind.routeThreadRef,
+        runId: input.pending.interruptRunId,
+        interrupt: input.interrupt,
+      });
+      revalidateStoppedRunForRewind(input.rewind.routeThreadRef, input.pending.interruptRunId);
+    } else {
+      revalidateIdleThreadForRewind(input.rewind.routeThreadRef);
+    }
+    const checkpoint = revalidateMessageForRewind(input.rewind.routeThreadRef, input.pending);
+    return await rewindToMessage({
+      ...input.rewind,
+      turnCount: input.pending.turnCount,
+      restoreFiles: input.restoreFiles,
+      checkpoint,
+    });
+  } catch (error) {
+    return {
+      error:
+        error instanceof Error
+          ? error.message
+          : "Failed to stop the current turn before rewinding.",
+    };
   }
 }
 
@@ -5953,6 +5997,7 @@ export default function ChatView(props: ChatViewProps) {
     turnCount: number,
     messageId: MessageId,
     restoreFiles?: boolean,
+    pending?: PendingRevert,
   ) => {
     const localApi = readLocalApi();
     if (
@@ -5962,8 +6007,8 @@ export default function ChatView(props: ChatViewProps) {
       !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)
     )
       return;
-    const message = timelineMessages.find((message) => message.id === messageId);
-    if (!message || message.role !== "user") return;
+    const message = timelineMessages.find((candidate) => candidate.id === messageId);
+    if (!message || message.role !== "user" || message.runId === null) return;
 
     if (!supportsConversationRollback) {
       setThreadError(
@@ -5979,12 +6024,24 @@ export default function ChatView(props: ChatViewProps) {
       );
       return;
     }
-    if (phase === "running" || isSendBusy || isConnecting) {
-      setThreadError(activeThread.id, "Interrupt the current turn before reverting checkpoints.");
+    if (restoreFiles === undefined) {
+      if ((phase === "running" || isSendBusy || isConnecting) && activeRunningTurnId === null) {
+        setThreadError(
+          activeThread.id,
+          "Wait for the current action to become interruptible, then try again.",
+        );
+        return;
+      }
+      openRevertConfirm(routeThreadKey, {
+        turnCount,
+        messageId,
+        messageRunId: message.runId,
+        interruptRunId: activeRunningTurnId,
+      });
       return;
     }
-    if (restoreFiles === undefined) {
-      openRevertConfirm(routeThreadKey, { turnCount, messageId });
+    if (pending === undefined || message.runId !== pending.messageRunId) {
+      setThreadError(activeThread.id, "The thread changed. Choose Edit from here again.");
       return;
     }
 
@@ -5992,19 +6049,30 @@ export default function ChatView(props: ChatViewProps) {
       rewindingThreadKeys: new Set(store.rewindingThreadKeys).add(routeThreadKey),
     }));
     setThreadError(activeThread.id, null);
-    const rewind = await rewindToMessage({
-      message,
-      environmentId,
-      routeThreadRef,
-      threadId: activeThread.id,
-      turnCount,
+    const interruptRunId = pending.interruptRunId;
+    const rewind = await stopAndRewindToMessage({
+      pending,
       restoreFiles,
-      // Keep the live checkpoint identity when command context refetches a bounded window.
-      checkpoint: findRevertCheckpoint(serverProjection?.checkpoints ?? [], turnCount),
-      draftTarget: composerDraftTarget,
-      composerHasPendingAttachments: composerRef.current?.hasPendingAttachments() === true,
-      createAssetUrl: createAttachmentAssetUrl,
-      revertThreadCheckpoint,
+      interrupt:
+        interruptRunId === null
+          ? null
+          : async () => {
+              const result = await interruptThreadTurn({
+                environmentId,
+                input: { threadId: activeThread.id, runId: interruptRunId },
+              });
+              if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+            },
+      rewind: {
+        message,
+        environmentId,
+        routeThreadRef,
+        threadId: activeThread.id,
+        draftTarget: composerDraftTarget,
+        composerHasPendingAttachments: composerRef.current?.hasPendingAttachments() === true,
+        createAssetUrl: createAttachmentAssetUrl,
+        revertThreadCheckpoint,
+      },
     });
     useComposerDraftStore.setState((store) => {
       const remaining = new Set(store.rewindingThreadKeys);
@@ -6025,8 +6093,8 @@ export default function ChatView(props: ChatViewProps) {
     }
   };
   const onRevertToTurnCountStable = useStableCallback(onRevertToTurnCount);
-  const onConfirmRevert = (turnCount: number, messageId: MessageId, restoreFiles: boolean) => {
-    void onRevertToTurnCount(turnCount, messageId, restoreFiles);
+  const onConfirmRevert = (pending: PendingRevert, restoreFiles: boolean) => {
+    void onRevertToTurnCount(pending.turnCount, pending.messageId, restoreFiles, pending);
   };
   const onConfirmRevertStable = useStableCallback(onConfirmRevert);
 

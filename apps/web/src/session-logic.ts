@@ -1061,6 +1061,7 @@ export function deriveRevertTurnCountByUserMessageId(input: {
   readonly threadStartCheckpointReady: boolean;
   readonly availableRevertTurnCounts?: ReadonlySet<number> | undefined;
   readonly unsettledRunId?: RunId | null;
+  readonly activeRunId?: RunId | null;
 }): Map<ChatMessage["id"], number> {
   const readyTurnCountByRunId = new Map<RunId, number>();
   for (const checkpoint of input.checkpoints) {
@@ -1097,7 +1098,11 @@ export function deriveRevertTurnCountByUserMessageId(input: {
     }
     if (entry.kind !== "message") continue;
     const { message } = entry;
-    if (message.role !== "user" || message.runId === input.unsettledRunId) continue;
+    if (
+      message.role !== "user" ||
+      (message.runId === input.unsettledRunId && message.runId !== input.activeRunId)
+    )
+      continue;
     if (message.inputIntent !== "turn_start" && message.inputIntent !== "queued_turn") continue;
     const target = targetByRunId.get(runId);
     if (

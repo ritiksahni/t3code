@@ -2,6 +2,7 @@ import type {
   DeviceServiceState,
   EnvironmentId,
   MessageId,
+  RunId,
   ScopedThreadRef,
   ThreadId,
 } from "@t3tools/contracts";
@@ -180,9 +181,11 @@ export function BranchRestoreConfirmHost(props: {
   );
 }
 
-interface PendingRevert {
+export interface PendingRevert {
   readonly turnCount: number;
   readonly messageId: MessageId;
+  readonly messageRunId: RunId;
+  readonly interruptRunId: RunId | null;
 }
 
 const revertConfirmAtom = makeThreadOverlayAtom<PendingRevert>("revert-confirm");
@@ -193,13 +196,13 @@ export function openRevertConfirm(threadKey: string, pending: PendingRevert): vo
 
 export function RevertConfirmHost(props: {
   readonly threadKey: string;
-  readonly onConfirm: (turnCount: number, messageId: MessageId, restoreFiles: boolean) => void;
+  readonly onConfirm: (pending: PendingRevert, restoreFiles: boolean) => void;
 }) {
   const pending = useThreadOverlay(revertConfirmAtom, props.threadKey);
   const confirm = (restoreFiles: boolean) => {
     if (pending === null) return;
     closeThreadOverlay(revertConfirmAtom);
-    props.onConfirm(pending.turnCount, pending.messageId, restoreFiles);
+    props.onConfirm(pending, restoreFiles);
   };
   return (
     <AlertDialog
@@ -212,8 +215,9 @@ export function RevertConfirmHost(props: {
         <AlertDialogHeader>
           <AlertDialogTitle>Edit from here?</AlertDialogTitle>
           <AlertDialogDescription>
-            Rewind chat to before this message. Your prompt and attachments return to the composer.
-            “Revert files too” also undoes your own edits.
+            {pending === null || pending.interruptRunId === null
+              ? "Rewind chat to before this message. Your prompt and attachments return to the composer. “Revert files too” also undoes your own edits."
+              : "Stop the current turn, rewind chat to before this message, and return its prompt and attachments to the composer. “Revert files too” also undoes your own edits."}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>

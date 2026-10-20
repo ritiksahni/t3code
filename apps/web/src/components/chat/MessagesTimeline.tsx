@@ -144,7 +144,7 @@ import {
   SmartphoneIcon,
   SquarePenIcon,
   TerminalIcon,
-  Undo2Icon,
+  PencilIcon,
   HammerIcon,
   WrenchIcon,
   Code2Icon,
@@ -364,6 +364,7 @@ interface TimelineRowActivityState {
   awaitingUser: boolean;
   isPreparingWorktree: boolean;
   latestRunId: RunId | null;
+  activeRunId: RunId | null;
   backgroundWorktreeSetup: WorktreeSetupSnapshot | null;
 }
 
@@ -1338,6 +1339,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     awaitingUser,
     isPreparingWorktree,
     latestRunId: latestRun?.runId ?? null,
+    activeRunId: runningRunId ?? null,
   };
   const listHeaderLeadingContent =
     parentThreadLink === null ? (
@@ -2571,13 +2573,16 @@ function RevertUserMessageButton({
             type="button"
             size="xs"
             variant="ghost"
-            disabled={activity.isRevertingCheckpoint || activity.isWorking}
+            disabled={
+              activity.isRevertingCheckpoint ||
+              (activity.isWorking && activity.activeRunId === null)
+            }
             onClick={() => ctx.onRevertToTurnCount(turnCount, messageId)}
             aria-label="Edit from here"
           />
         }
       >
-        <Undo2Icon className="size-3" />
+        <PencilIcon className="size-3" />
       </TooltipTrigger>
       <TooltipPopup side="top">Edit from here</TooltipPopup>
     </Tooltip>
